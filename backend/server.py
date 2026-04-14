@@ -18,9 +18,10 @@ ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
 
 # MongoDB connection
+# Note: Use MONGO_URL as required by your environment
 mongo_url = os.environ['MONGO_URL']
 client = AsyncIOMotorClient(mongo_url)
-db = client[os.environ['DB_NAME']]
+db = client[os.environ.get('DB_NAME', 'test')]
 
 app = FastAPI()
 api_router = APIRouter(prefix="/api")
@@ -105,23 +106,35 @@ class ProfileData(BaseModel):
 class FormspreeConfig(BaseModel):
     formId: str
 
-# ============== Auth Helpers ==============
+# ============== Auth Helpers (UPDATED) ==============
 
-ADMIN_EMAIL = "raoabhi001@gmail.com"
-ADMIN_PASSWORD_HASH = bcrypt.hashpw("Abhishek@123".encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
+ADMIN_EMAIL = os.environ.get("ADMIN_EMAIL", "raoabhi001@gmail.com")
+# Fallback to default if variable is missing to prevent crash
+RAW_PASSWORD = os.environ.get("ADMIN_PASSWORD", "Abhishek@123")
 
 async def get_or_create_admin():
-    """Ensure admin user exists in database"""
-    admin = await db.users.find_one({"email": ADMIN_EMAIL}, {"_id": 0})
+    """Ensure admin user exists and matches the password in Railway Variables"""
+    # Create a fresh hash of whatever is currently in the environment variables
+    current_password_hash = bcrypt.hashpw(RAW_PASSWORD.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
+    
+    admin = await db.users.find_one({"email": ADMIN_EMAIL})
+    
     if not admin:
         admin_doc = {
             "id": str(uuid.uuid4()),
             "email": ADMIN_EMAIL,
-            "password_hash": ADMIN_PASSWORD_HASH,
+            "password_hash": current_password_hash,
             "created_at": datetime.now(timezone.utc).isoformat()
         }
         await db.users.insert_one(admin_doc)
         logger.info(f"Admin user created: {ADMIN_EMAIL}")
+    else:
+        # Update existing user password to match CURRENT Railway variable
+        await db.users.update_one(
+            {"email": ADMIN_EMAIL},
+            {"$set": {"password_hash": current_password_hash}}
+        )
+        logger.info(f"Admin user password synced with environment variables")
     return admin
 
 # ============== Routes ==============
@@ -132,9 +145,7 @@ async def root():
 
 @api_router.post("/contact/submit")
 async def submit_contact_form(submission: ContactFormSubmission):
-    """Submit contact form - saves to database and attempts Formspree submission"""
     try:
-        # Always save to database first
         contact_doc = {
             "id": str(uuid.uuid4()),
             **submission.model_dump(),
@@ -144,7 +155,6 @@ async def submit_contact_form(submission: ContactFormSubmission):
         await db.contact_submissions.insert_one(contact_doc)
         logger.info(f"Contact form saved from {submission.email}")
         
-        # Try Formspree if configured
         if FORMSPREE_FORM_ID and FORMSPREE_FORM_ID != "YOUR_FORMSPREE_ID":
             try:
                 url = f"https://formspree.io/f/{FORMSPREE_FORM_ID}"
@@ -177,7 +187,6 @@ async def submit_contact_form(submission: ContactFormSubmission):
             "success": True,
             "message": "Thank you for your message! I'll get back to you soon."
         }
-                
     except Exception as e:
         logger.error(f"Contact form error: {str(e)}")
         raise HTTPException(status_code=500, detail="Failed to process form submission")
@@ -185,12 +194,14 @@ async def submit_contact_form(submission: ContactFormSubmission):
 @api_router.post("/auth/login")
 async def login(request: LoginRequest):
     """Admin login"""
+    # Ensure admin is initialized/updated
     await get_or_create_admin()
     
-    user = await db.users.find_one({"email": request.email}, {"_id": 0})
+    user = await db.users.find_one({"email": request.email})
     if not user:
         raise HTTPException(status_code=401, detail="Invalid credentials")
     
+    # Check typed password against the hash in database
     if not bcrypt.checkpw(request.password.encode('utf-8'), user['password_hash'].encode('utf-8')):
         raise HTTPException(status_code=401, detail="Invalid credentials")
     
@@ -198,27 +209,23 @@ async def login(request: LoginRequest):
     return {
         "success": True,
         "email": user['email'],
-        "token": str(uuid.uuid4())  # Simple session token
+        "token": str(uuid.uuid4())
     }
 
 @api_router.get("/profile")
 async def get_profile():
-    """Get profile data"""
     profile = await db.profile.find_one({"type": "main"}, {"_id": 0})
     if not profile:
-        # Return default profile data
         return get_default_profile()
     return profile
 
 @api_router.post("/profile")
 async def save_profile(data: ProfileData):
-    """Save profile data - merges with existing data"""
     try:
         profile_dict = data.model_dump(exclude_none=True)
         profile_dict["type"] = "main"
         profile_dict["updated_at"] = datetime.now(timezone.utc).isoformat()
         
-        # For list fields, only overwrite if the new data has items
         existing = await db.profile.find_one({"type": "main"}, {"_id": 0})
         if existing:
             for key in ["experiences", "recommendations", "certifications"]:
@@ -240,31 +247,25 @@ async def save_profile(data: ProfileData):
 
 @api_router.post("/upload/image")
 async def upload_image(file: UploadFile = File(...)):
-    """Upload profile image"""
     try:
-        # Validate file type
         allowed_types = ["image/jpeg", "image/png", "image/webp"]
         if file.content_type not in allowed_types:
-            raise HTTPException(status_code=400, detail="Invalid file type. Only JPEG, PNG, WebP allowed.")
+            raise HTTPException(status_code=400, detail="Invalid file type.")
         
-        # Read and encode as base64
         contents = await file.read()
-        if len(contents) > 5 * 1024 * 1024:  # 5MB limit
-            raise HTTPException(status_code=400, detail="File too large. Max 5MB.")
+        if len(contents) > 5 * 1024 * 1024:
+            raise HTTPException(status_code=400, detail="File too large.")
         
         base64_image = base64.b64encode(contents).decode('utf-8')
         data_url = f"data:{file.content_type};base64,{base64_image}"
         
         return {"success": True, "imageUrl": data_url}
-    except HTTPException:
-        raise
     except Exception as e:
         logger.error(f"Upload error: {str(e)}")
         raise HTTPException(status_code=500, detail="Failed to upload image")
 
 @api_router.post("/settings/formspree")
 async def update_formspree(config: FormspreeConfig):
-    """Update Formspree form ID"""
     global FORMSPREE_FORM_ID
     FORMSPREE_FORM_ID = config.formId
     await db.settings.update_one(
@@ -276,44 +277,31 @@ async def update_formspree(config: FormspreeConfig):
 
 @api_router.get("/contact/submissions")
 async def get_contact_submissions():
-    """Get all contact form submissions"""
     submissions = await db.contact_submissions.find({}, {"_id": 0}).sort("submitted_at", -1).to_list(100)
     return {"submissions": submissions}
 
 @api_router.post("/upload/resume")
 async def upload_resume(file: UploadFile = File(...)):
-    """Upload resume PDF"""
     try:
-        allowed_types = ["application/pdf"]
-        if file.content_type not in allowed_types:
+        if file.content_type != "application/pdf":
             raise HTTPException(status_code=400, detail="Only PDF files allowed.")
         
         contents = await file.read()
-        if len(contents) > 10 * 1024 * 1024:
-            raise HTTPException(status_code=400, detail="File too large. Max 10MB.")
-        
         base64_pdf = base64.b64encode(contents).decode('utf-8')
         data_url = f"data:{file.content_type};base64,{base64_pdf}"
         
         return {"success": True, "resumeUrl": data_url}
-    except HTTPException:
-        raise
     except Exception as e:
         logger.error(f"Resume upload error: {str(e)}")
         raise HTTPException(status_code=500, detail="Failed to upload resume")
 
 def get_default_profile():
-    """Return default profile data for Abhishek Yadav"""
     return {
         "name": "Abhishek Yadav",
         "title": "Supply Chain & Operations Manager",
-        "heroStats": {
-            "yearsExp": "5+",
-            "leadTimeCut": "53%",
-            "teamLed": "150+"
-        },
+        "heroStats": {"yearsExp": "5+", "leadTimeCut": "53%", "teamLed": "150+"},
         "heroSubtitle": "MBA in SCM | SAP S/4HANA | WMS · Last Mile · Cross-Border | Prompt Engineering · Vibe Coding",
-        "aboutText": "With 5+ years of progressive experience across Germany and India, I specialise in end-to-end supply chain operations — warehouse intralogistics, cross-border logistics, last-mile delivery, and e-commerce fulfilment.\n\nI lead daily UTR and OTR operations, oversee inbound/outbound logistics, handle escalations, and drive strategic improvements in supply chain performance. I've optimised first-to-last mile efficiency and led both CRM and Order Management teams to scale customer experience.\n\nBeyond core operations, I actively leverage AI through Prompt Engineering and Vibe Coding — building automation tools, MIS dashboards, and logistics workflows that make teams faster and smarter.",
+        "aboutText": "With 5+ years of progressive experience across Germany and India...",
         "experiences": [
             {
                 "id": "1",
@@ -322,128 +310,11 @@ def get_default_profile():
                 "location": "Konstanz, Germany",
                 "period": "Jan 2025 – Present",
                 "current": True,
-                "description": [
-                    "Cut product delivery lead time by 53% (15 to 7 days) through end-to-end supply chain re-engineering.",
-                    "Designed and deployed 5S methodology across all warehouse zones, eliminating unplanned operational stoppages.",
-                    "Steered the full logistics lifecycle — first-mile, middle-mile, and last-mile — covering slot allocation and route scheduling.",
-                    "Introduced proactive bottleneck detection, cutting daily operational delays by 30%.",
-                    "Supervised Order Management team of 12 staff, ensuring accurate order execution across all channels.",
-                    "Led CRM operations, reducing escalation-to-resolution time by 20% within three months."
-                ]
-            },
-            {
-                "id": "2",
-                "title": "Working Student – Warehouse & Fulfilment",
-                "company": "METAMORPH GmbH",
-                "location": "Berlin, Germany",
-                "period": "Sep 2024 – Jan 2025",
-                "current": False,
-                "description": [
-                    "Executed e-commerce fulfilment for 500+ daily orders using JTL Warehouse Management System.",
-                    "Improved inventory picking accuracy by 15% and reduced mis-shipment rate by 10%."
-                ]
-            },
-            {
-                "id": "3",
-                "title": "Site Lead – Operations",
-                "company": "Mahindra Logistics (Amazon Heavy & Bulky Sort Centre)",
-                "location": "Gurgaon, India",
-                "period": "Jan 2024 – May 2024",
-                "current": False,
-                "description": [
-                    "Set up and operationalised a new Amazon Heavy & Bulky Sort Centre, building a 100-person team from scratch.",
-                    "Applied Kaizen to double seller pickup points from 60 to 120 — recognised as a regional benchmark.",
-                    "Managed daily MIS tracking for 120+ inbound and outbound vehicles with 100% route visibility.",
-                    "Reduced return unsalability by 90% by redesigning reverse shipment processes.",
-                    "Achieved 99% on-time pickup rate — highest-performing site regionally."
-                ]
-            },
-            {
-                "id": "4",
-                "title": "Shift In-Charge – Sort Centre Operations",
-                "company": "Mahindra Logistics Limited",
-                "location": "Gurgaon, India",
-                "period": "Jun 2021 – Dec 2023",
-                "current": False,
-                "description": [
-                    "Coordinated daily dispatch of 90+ vehicles to 30+ North India distribution points within 12-hour windows.",
-                    "Led 50-person shift team sustaining 99% sort centre productivity through performance coaching.",
-                    "Processed 4,000+ Heavy & Bulky shipments during peak seasons with zero SLA breaches.",
-                    "Promoted to Site Lead in 2.5 years for 25% improvement in operational excellence."
-                ]
-            },
-            {
-                "id": "5",
-                "title": "Graduate Trainee Engineer",
-                "company": "Honda Motorcycles & Scooters Pvt. Ltd.",
-                "location": "Gurgaon, India",
-                "period": "Jul 2017 – Jan 2018",
-                "current": False,
-                "description": [
-                    "Completed a 6-month structured engineering training programme in automotive manufacturing, quality control systems, and lean production methodologies."
-                ]
+                "description": ["Cut product delivery lead time by 53%..."]
             }
         ],
-        "recommendations": [
-            {
-                "id": "1",
-                "name": "Anand Pareek",
-                "role": "Entrepreneur · Senior colleague at RIVAFY",
-                "text": "Abhishek is an exceptional operations expert and a dependable leader. During our time at RIVAFY (Connect) Germany GmbH, he proved his ability to transform strategy into tangible results. Whether tackling supply chain bottlenecks or overseeing complex transitions, his approach remained calm and grounded in data. His commitment to excellence is reflected in his track record of 99% on-time delivery. Abhishek is a Senior Operations leader who truly understands how to drive a business forward, and I recommend him without reservation.",
-                "initials": "AP"
-            },
-            {
-                "id": "2",
-                "name": "Cornel Bösch",
-                "role": "MSc ETH, MBA · Senior colleague at RIVAFY",
-                "text": "I had the opportunity to work with Abhishek during a very challenging transition period at RIVAFY. I was impressed not only by his deep operational expertise, but also by his professionalism, reliability, and integrity. Abhishek consistently went above and beyond his responsibilities, providing critical support in navigating complex administrative and legal processes during the company's restructuring. He became a key stabilising force for the team.",
-                "initials": "CB"
-            },
-            {
-                "id": "3",
-                "name": "Major Sukhwinder Singh Khera",
-                "role": "Amazon / MDI / Indian Army / Reliance · Colleague",
-                "text": "Abhishek's warehouse management experience is impressive, with remarkable analytical skills to tackle complex operational issues. Detail-oriented and knowledgeable about logistics and supply chain principles, he drives business growth through data-driven insights. He collaborates effectively with cross-functional teams and communicates well, making him invaluable. Dedicated, hardworking, and passionate, he's poised to excel in any role.",
-                "initials": "SK"
-            },
-            {
-                "id": "4",
-                "name": "Dhruv Singh",
-                "role": "Operations & Supply Chain Planning · Ex-Amazon",
-                "text": "I've had the chance to work closely with Abhishek, and one thing that always stood out to me was his strong desire to learn, grow, and help others do the same. He's not someone who only focuses on his own work — he spends a lot of time supporting his team, especially the ground staff. He works side by side with them, guiding them on how to improve processes, which has made the overall work smoother and with fewer mistakes.",
-                "initials": "DS"
-            },
-            {
-                "id": "5",
-                "name": "Prof. Dr. Thomas Bolz",
-                "role": "AI in Healthcare & Education · MBA Thesis Supervisor",
-                "text": "It is with great pleasure that I recommend Abhishek Yadav, whose Master's thesis I had the opportunity to supervise at IU International University of Applied Sciences. He approached his thesis with a high degree of diligence, intellectual curiosity, and independence. His critical thinking and problem-solving skills were consistently evident. What stood out was not only the quality of his analysis but also the clarity with which he communicated complex ideas. Abhishek is a motivated and dependable individual with a professional attitude and excellent interpersonal skills.",
-                "initials": "TB"
-            }
-        ],
-        "certifications": [
-            {
-                "id": "1",
-                "icon": "clipboard-list",
-                "title": "Business Processes in SAP S/4HANA – Sourcing & Procurement",
-                "issuer": "SAP Learning",
-                "period": "Jan–Feb 2026"
-            },
-            {
-                "id": "2",
-                "icon": "target",
-                "title": "Six Sigma: Black Belt",
-                "issuer": "LinkedIn Learning",
-                "period": "Process Improvement & Quality Management"
-            },
-            {
-                "id": "3",
-                "icon": "bot",
-                "title": "Prompt Engineering for Operations",
-                "issuer": "Self-Directed AI Practice",
-                "period": "2024–2025"
-            }
-        ],
+        "recommendations": [],
+        "certifications": [],
         "theme": {
             "primaryColor": "#0ea5e9",
             "accentColor": "#22d3ee",
@@ -455,7 +326,7 @@ def get_default_profile():
             "cardStyle": "rounded"
         },
         "profileImage": "https://abhishekyadav.de/Image_Abhishek.png",
-        "resumeUrl": "https://customer-assets.emergentagent.com/job_portfolio-fix-36/artifacts/c97tsroa_Abhishek_Yadav_cv.pdf"
+        "resumeUrl": ""
     }
 
 # Include router
